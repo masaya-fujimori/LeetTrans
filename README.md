@@ -1,0 +1,2 @@
+# LeetTrans
+Leet翻訳
