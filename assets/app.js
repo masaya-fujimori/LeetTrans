@@ -660,8 +660,8 @@ const KATA_TO_HALF = {
   ペ: "ﾍﾟ",
   ポ: "ﾎﾟ",
   ヴ: "ｳﾞ",
-  ー: "ｰ",
-  ・: "･",
+  "ー": "ｰ",
+  "・": "･",
 };
 
 function hiraToKata(s) {
