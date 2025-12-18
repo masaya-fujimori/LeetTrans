@@ -17,6 +17,7 @@ const els = {
   toast: $("toast"),
   detectedMeta: $("detectedMeta"),
   outputMeta: $("outputMeta"),
+  misleadMeta: $("misleadMeta"),
   inputCount: $("inputCount"),
   outputCount: $("outputCount"),
 };
@@ -111,6 +112,15 @@ const EN_PHRASES = [
   ["translate", "翻訳する"],
   ["app", "アプリ"],
   ["world", "世界"],
+  // Mislead targets (single words)
+  ["cruel", "残酷"],
+  ["cash", "現金"],
+  ["scheme", "企み"],
+  ["cue", "合図"],
+  ["angel", "天使"],
+  ["angle", "角度"],
+  ["static", "静的"],
+  ["panic", "パニック"],
 ];
 
 /** @type {Array<[string, string]>} */
@@ -130,7 +140,215 @@ const JA_PHRASES = [
   ["翻訳", "translate"],
   ["アプリ", "app"],
   ["世界", "world"],
+  // Japanese puns (mislead targets)
+  ["歌手", "singer"],
+  ["隙間", "gap"],
+  ["急", "urgent"],
+  ["米と", "rice and"],
+  ["残酷", "cruel"],
+  ["現金", "cash"],
+  ["企み", "scheme"],
+  ["合図", "cue"],
 ];
+
+// --------------------------
+// Mislead layer (meaning confusion)
+// --------------------------
+
+/** @typedef {{ from: string, to: string, kind: string, result?: string }} MisleadLog */
+
+const EN_MISLEAD_MANUAL = {
+  CRUD: "CRUEL",
+  CACHE: "CASH",
+  SCHEMA: "SCHEME",
+  QUEUE: "CUE",
+};
+
+// Candidate words we can "misread" into (small, default set)
+const EN_MISLEAD_LEXICON = [
+  "cruel",
+  "cash",
+  "scheme",
+  "cue",
+  "angel",
+  "angle",
+  "panic",
+  "static",
+  "public",
+  "publish",
+  "logger",
+  "longer",
+  "commit",
+  "comet",
+  "config",
+  "conflict",
+];
+
+const JA_PUN_MAP = {
+  "キャッシュ": "歌手",
+  "スキーマ": "隙間",
+  "キュー": "急",
+  "コミット": "米と",
+};
+
+function isAllCapsWord(w) {
+  return /^[A-Z]{2,}$/.test(w);
+}
+
+function levenshtein(a, b, maxThreshold) {
+  // Early-exit Levenshtein (small strings only). Returns maxThreshold+1 if over.
+  if (a === b) return 0;
+  const al = a.length;
+  const bl = b.length;
+  if (Math.abs(al - bl) > maxThreshold) return maxThreshold + 1;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+
+  /** @type {number[]} */
+  let prev = new Array(bl + 1);
+  /** @type {number[]} */
+  let cur = new Array(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+
+  for (let i = 1; i <= al; i++) {
+    cur[0] = i;
+    let rowMin = cur[0];
+    const ca = a.charCodeAt(i - 1);
+    for (let j = 1; j <= bl; j++) {
+      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+      const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      cur[j] = v;
+      if (v < rowMin) rowMin = v;
+    }
+    if (rowMin > maxThreshold) return maxThreshold + 1;
+    const tmp = prev;
+    prev = cur;
+    cur = tmp;
+  }
+  return prev[bl];
+}
+
+function translateEnTokenToJa(token) {
+  const key = token.toLowerCase();
+  const dict = EN_PHRASES.find(([en]) => en === key);
+  return dict ? dict[1] : enWordToKatakanaish(token);
+}
+
+function translateJaTokenToEn(token) {
+  const dict = JA_PHRASES.find(([ja]) => ja === token);
+  if (dict) return dict[1];
+  if (/[ぁ-んァ-ンー]/.test(token)) return kanaToRomaji(token);
+  return token;
+}
+
+function applyMisleadEnWord(word, level, rand, logs) {
+  const original = word;
+
+  // 1) Manual for acronyms / classic tech words
+  if (isAllCapsWord(word)) {
+    const forced = EN_MISLEAD_MANUAL[word];
+    if (forced && forced !== word) {
+      logs.push({ from: original, to: forced, kind: "en_manual", result: translateEnTokenToJa(forced) });
+      return forced;
+    }
+  }
+
+  // 2) Exact manual (case-insensitive) at level>=1 but low probability at L1
+  const upper = word.toUpperCase();
+  if (EN_MISLEAD_MANUAL[upper] && EN_MISLEAD_MANUAL[upper] !== upper) {
+    const p = level === 1 ? 0.18 : 0.60;
+    if (chance(rand, p)) {
+      const to = EN_MISLEAD_MANUAL[upper];
+      logs.push({ from: original, to, kind: "en_manual", result: translateEnTokenToJa(to) });
+      return matchCase(word, to);
+    }
+  }
+
+  // 3) Fuzzy spell confusion (level>=2)
+  if (level < 2) return word;
+  const lower = word.toLowerCase();
+  if (lower.length < 4) return word;
+  if (!/^[a-z]+(?:'[a-z]+)?$/i.test(word)) return word;
+
+  const maxD = level === 2 ? 1 : 2;
+  const first = lower[0];
+  const candidates = EN_MISLEAD_LEXICON;
+
+  /** @type {{cand:string, d:number}[]} */
+  const hits = [];
+  for (const cand of candidates) {
+    if (cand === lower) continue;
+    if (cand[0] !== first) continue;
+    if (Math.abs(cand.length - lower.length) > maxD) continue;
+    const d = levenshtein(lower, cand, maxD);
+    if (d <= maxD) hits.push({ cand, d });
+  }
+
+  if (hits.length === 0) return word;
+  hits.sort((a, b) => a.d - b.d || a.cand.length - b.cand.length);
+
+  // L2: rare, L3: more frequent
+  const fireP = level === 2 ? 0.18 : 0.42;
+  if (!chance(rand, fireP)) return word;
+
+  const bestD = hits[0].d;
+  const best = hits.filter((h) => h.d === bestD).map((h) => h.cand);
+  const picked = pick(rand, best);
+  const to = matchCase(word, picked);
+  logs.push({ from: original, to, kind: "en_fuzzy", result: translateEnTokenToJa(picked) });
+  return to;
+}
+
+function applyMisleadJaToken(tok, level, rand, logs) {
+  const original = tok;
+  if (level < 2) return tok;
+  const to = JA_PUN_MAP[tok];
+  if (!to) return tok;
+  const p = level === 2 ? 0.35 : 0.65;
+  if (!chance(rand, p)) return tok;
+  logs.push({ from: original, to, kind: "ja_pun", result: translateJaTokenToEn(to) });
+  return to;
+}
+
+function matchCase(from, to) {
+  if (isAllCapsWord(from)) return to.toUpperCase();
+  if (/^[A-Z][a-z]+$/.test(from)) return to[0].toUpperCase() + to.slice(1);
+  if (/^[a-z]+$/.test(from)) return to.toLowerCase();
+  return to;
+}
+
+function applyMislead(text, effectiveDirection, level) {
+  const src = normalizeNewlines(text ?? "");
+  const lv = clamp(Number(level) || 1, 1, 3);
+  const rand = withStableRand(src + "::mislead", lv);
+
+  /** @type {MisleadLog[]} */
+  const logs = [];
+
+  if (effectiveDirection === "en2ja") {
+    const parts = src.match(/([A-Za-z]+(?:'[A-Za-z]+)?)|(\d+)|(\s+)|([^\sA-Za-z\d]+)/g) || [];
+    const out = parts
+      .map((p) => {
+        if (/^[A-Za-z]/.test(p)) return applyMisleadEnWord(p, lv, rand, logs);
+        return p;
+      })
+      .join("");
+    return { text: out, logs };
+  }
+
+  // ja2en
+  const parts =
+    src.match(/([ぁ-んァ-ンー]+)|([一-龯]+)|([A-Za-z]+(?:'[A-Za-z]+)?)|(\d+)|(\s+)|([^\sぁ-んァ-ンー一-龯A-Za-z\d]+)/g) ||
+    [];
+  const out = parts
+    .map((p) => {
+      if (/^[ぁ-んァ-ンー一-龯]/.test(p)) return applyMisleadJaToken(p, lv, rand, logs);
+      if (/^[A-Za-z]/.test(p)) return applyMisleadEnWord(p, lv, rand, logs);
+      return p;
+    })
+    .join("");
+  return { text: out, logs };
+}
 
 function applyEnPhraseDict(text) {
   let out = text;
@@ -733,14 +951,15 @@ function translate(text, direction, level) {
   let effective = direction;
   if (direction === "auto") effective = detectJapanese(src) ? "ja2en" : "en2ja";
 
-  const base = translateBase(src, effective, lv);
+  const mis = applyMislead(src, effective, lv);
+  const base = translateBase(mis.text, effective, lv);
   const rand = withStableRand(src + "::out", lv);
   const outputLang = effective === "en2ja" ? "ja" : "en";
 
   const styled =
     outputLang === "en" ? leetifyEnglish(base, lv, rand) : leetifyJapanese(base, lv, rand);
 
-  return { effective, outputLang, base, styled };
+  return { effective, outputLang, base, styled, misleadLogs: mis.logs };
 }
 
 // --------------------------
@@ -777,9 +996,18 @@ function runTranslate() {
   const det = res.effective === "en2ja" ? "英語 → 日本語" : "日本語 → 英語";
   els.detectedMeta.textContent = dir === "auto" ? `自動: ${det}` : `指定: ${det}`;
   els.outputMeta.textContent = res.outputLang === "ja" ? "出力: 日本語（Leet）" : "出力: English (Leet)";
+  els.misleadMeta.textContent = formatMisleadMeta(res.misleadLogs);
 
   els.inputCount.textContent = `${countChars(src)} 文字`;
   els.outputCount.textContent = `${countChars(res.styled)} 文字`;
+}
+
+function formatMisleadMeta(logs) {
+  if (!logs || logs.length === 0) return "";
+  const max = 2;
+  const shown = logs.slice(0, max).map((l) => (l.result ? `${l.from}→${l.to}→${l.result}` : `${l.from}→${l.to}`));
+  const more = logs.length > max ? ` +${logs.length - max}` : "";
+  return `誤誘導: ${shown.join(" / ")}${more}`;
 }
 
 els.input.addEventListener("input", scheduleTranslate);
